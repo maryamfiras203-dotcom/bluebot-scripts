@@ -2,9 +2,8 @@
     ==========================================================
       PowerShell Script: User Cleanup Automation (Template)
       Doel: Automatisch verwijderen van gearchiveerde gebruikersmappen
-      Versie: Template (zonder vertrouwelijke info)
-      Auteur: [Jouw naam]
-      Datum: [Datum]
+      Auteur: Maryam Al-mzaiel
+      Datum: 13/10/2025
       Project: BLUEBOT – Automatisering & Standaardisatie ICT
     ==========================================================
 #>
@@ -124,3 +123,4 @@ $Report | Format-Table -AutoSize
 
 $TotalFreed = ($Report | Measure-Object -Property VrijgemaaktMB -Sum).Sum
 Write-Host "`nTOTAAL vrijgemaakt: $TotalFreed MB" -ForegroundColor Green
+
