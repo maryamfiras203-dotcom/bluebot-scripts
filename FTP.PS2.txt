@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==== CONFIG – enkel hier aanpassen via environment vars of .env (NIET in repo zetten) ====
+# Voor productie: export FTP_HOST, FTP_USER, FTP_PASS, FTP_PORT in je shell of CI/CD secrets
+FTP_HOST="${FTP_HOST:-zone.example.org}"
+FTP_USER="${FTP_USER:-user-placeholder}"
+FTP_PASS="${FTP_PASS:-password-pashouder}"
+FTP_PORT="${FTP_PORT:-22}"
+
+# Mappings: REMOTE:LOCAL:LABEL
+MAPPINGS=(
+  "/white:/data/whitelist:Whitelist"
+  "/blacklist:/data/blacklist:Blacklist"
+  "/groenelijst:/data/groenelijst:Groenelijst"
+)
+
+# Alleen bestanden met deze extensies worden gedownload (veiligheid)
+ALLOWED_EXTENSIONS=("txt" "csv" "list")
+# ======================================================================================
+
+# Controleer vereisten
+command -v lftp >/dev/null 2>&1 || { echo "lftp is niet geïnstalleerd. Installeer het (sudo apt install lftp)"; exit 1; }
+
+download_all() {
+  local REMOTE_DIR="$1"
+  local LOCAL_DIR="$2"
+  local LABEL="$3"
+
+  # check of lokale map bestaat, anders aanmaken
+  if [ ! -d "$LOCAL_DIR" ]; then
+    echo "  Lokale directory $LOCAL_DIR bestaat niet, aanmaken..."
+    mkdir -p "$LOCAL_DIR"
+  fi
+
+  echo " Ophalen van bestanden uit $REMOTE_DIR ..."
+
+  # Creëer extensie-regex (bijv. txt|csv|list)
+  local ext_regex
+  IFS='|' read -r -a _ <<< "${ALLOWED_EXTENSIONS[*]}"
+  ext_regex=$(IFS='|'; echo "${ALLOWED_EXTENSIONS[*]}")
+
+  # LFTP commando
+  lftp -u "${FTP_USER}","${FTP_PASS}" "sftp://${FTP_HOST}:${FTP_PORT}" <<EOF
+set sftp:auto-confirm yes
+cd $REMOTE_DIR || { echo " Directory $REMOTE_DIR niet gevonden op remote"; exit 1; }
+# Haal lijst met bestanden en filter op toegestane extensies
+# cls -1 lijst bestanden, filter met grep (POSIX regex)
+filelist=\$(cls -1 | grep -E "\.($ext_regex)$" || true)
+if [ -z "\$filelist" ]; then
+  echo "  Geen toegestane bestanden gevonden in $REMOTE_DIR"
+else
+  # mget met -O: output directory
+  mget -O "$LOCAL_DIR" \$filelist
+fi
+bye
+EOF
+
+  echo " Klaar met $LABEL"
+}
+
+# ==== MAIN LOOP ====
+for mapping in "${MAPPINGS[@]}"; do
+  REMOTE_DIR=$(echo "$mapping" | cut -d: -f1)
+  LOCAL_DIR=$(echo "$mapping" | cut -d: -f2)
+  LABEL=$(echo "$mapping" | cut -d: -f3)
+
+  download_all "$REMOTE_DIR" "$LOCAL_DIR" "$LABEL"
+done
+
+echo " Script klaar – alles opgehaald."
