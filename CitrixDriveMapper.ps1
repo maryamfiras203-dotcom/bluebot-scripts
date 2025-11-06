@@ -1,5 +1,5 @@
 # =====================================================================
-# Project: Citrix SMB Drive Mapper (generieke, veilige versie)
+# Project: Citrix SMB Drive Mapper 
 # Auteur: Maryam Al-mzaiel
 # Doel: Automatisch verbinden met netwerkdrives in Citrix-omgeving
 # Datum: 2025
@@ -157,3 +157,4 @@ Stop-Process -ProcessName explorer -Force
 # ---------------------------------------------------------------------
 Write-Output "=== Drive Mapping voltooid ==="
 Stop-Transcript
+
