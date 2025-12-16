@@ -1,5 +1,5 @@
 # =========================================================================
-# CITRIX SMB DRIVE MAPPER (2025) - GESANITIZED EXAMPLE VERSION
+# CITRIX SMB DRIVE MAPPER (2025) 
 # Includes: Cleanup, Retry Logic, Secure Login, Parser Fix
 # =========================================================================
 
@@ -241,3 +241,4 @@ if ($restartExplorer) {
 
 Write-Output "=== SMB Drive Mapper Script Completed ==="
 Stop-Transcript
+
