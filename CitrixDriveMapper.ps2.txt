@@ -1,0 +1,243 @@
+# =========================================================================
+# CITRIX SMB DRIVE MAPPER (2025) - GESANITIZED EXAMPLE VERSION
+# Includes: Cleanup, Retry Logic, Secure Login, Parser Fix
+# =========================================================================
+
+# --- 0. Load required GUI assemblies ---
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# --- 1. Define Drive Mappings ---
+$DriveMappings = @(
+    @{
+        DriveName = "T"
+        SharePath = "\\fileserver01.example.local\SharedData"
+        Type      = "Shared"
+    },
+    @{
+        DriveName = "H"
+        SharePath = "\\fileserver01.example.local\Users$"
+        Type      = "Private"
+    }
+)
+
+# --- 2. Setup Logging ---
+$logFolder = Join-Path $Env:LOCALAPPDATA -ChildPath "BluebotLogs"
+if (!(Test-Path $logFolder)) {
+    New-Item -ItemType Directory -Path $logFolder | Out-Null
+}
+
+Start-Transcript -Path (Join-Path $logFolder "SMBDriveMapper.log") -Force
+Write-Output "=== SMB Drive Mapper Script Started ==="
+
+# ---------------------------------------------------------
+# Function: Remove existing drive mappings safely
+# ---------------------------------------------------------
+function Remove-ExistingMapping {
+    param([string]$DriveLetter)
+
+    $DriveSpec = "${DriveLetter}:"
+
+    try {
+        Write-Output "INFO: Cleaning mapping for ${DriveSpec}"
+
+        Remove-PSDrive -Name $DriveLetter -Force -ErrorAction SilentlyContinue
+
+        cmd /c "net use ${DriveSpec} /delete /y 2>&1" | Out-Null
+
+        Write-Output "INFO: Cleanup completed for ${DriveSpec}"
+    }
+    catch {
+        Write-Output "WARNING: Cleanup error for ${DriveSpec}: $($_.Exception.Message)"
+    }
+}
+
+# --- Step 1: Cleanup ---
+foreach ($mapping in $DriveMappings) {
+    Remove-ExistingMapping -DriveLetter $mapping.DriveName
+}
+
+# ---------------------------------------------------------
+# 3. Detect user and build paths
+# ---------------------------------------------------------
+try {
+    $currentUser = $Env:USERNAME
+    if ([string]::IsNullOrWhiteSpace($currentUser)) {
+        throw "Username not detected"
+    }
+
+    Write-Output "INFO: Detected user: $currentUser"
+
+    # Example username transformation
+    $userBase = if ($currentUser.Length -gt 2) {
+        $currentUser.Substring(0, $currentUser.Length - 2)
+    } else {
+        $currentUser
+    }
+
+    $loginUserWithDomain = "EXAMPLE\user$userBase"
+    $userSpecificPath    = "\user$userBase"
+
+    Write-Output "INFO: Login user: $loginUserWithDomain"
+}
+catch {
+    Write-Output "ERROR: User detection failed: $($_.Exception.Message)"
+    Stop-Transcript
+    exit
+}
+
+# ---------------------------------------------------------
+# 4. Login Form (GUI)
+# ---------------------------------------------------------
+function Show-LoginForm {
+    param([string]$DefaultUser)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Network Drive Authentication"
+    $form.Size = New-Object System.Drawing.Size(300,200)
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+    $form.MinimizeBox = $false
+    $form.MaximizeBox = $false
+
+    $lblUser = New-Object System.Windows.Forms.Label
+    $lblUser.Text = "Username:"
+    $lblUser.Location = New-Object System.Drawing.Point(10,20)
+    $form.Controls.Add($lblUser)
+
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Text = $DefaultUser
+    $txtUser.Location = New-Object System.Drawing.Point(10,40)
+    $txtUser.Size = New-Object System.Drawing.Size(260,20)
+    $form.Controls.Add($txtUser)
+
+    $lblPass = New-Object System.Windows.Forms.Label
+    $lblPass.Text = "Password:"
+    $lblPass.Location = New-Object System.Drawing.Point(10,70)
+    $form.Controls.Add($lblPass)
+
+    $txtPass = New-Object System.Windows.Forms.MaskedTextBox
+    $txtPass.PasswordChar = '*'
+    $txtPass.Location = New-Object System.Drawing.Point(10,90)
+    $txtPass.Size = New-Object System.Drawing.Size(260,20)
+    $form.Controls.Add($txtPass)
+
+    $btnOK = New-Object System.Windows.Forms.Button
+    $btnOK.Text = "Login"
+    $btnOK.Location = New-Object System.Drawing.Point(70,130)
+    $form.Controls.Add($btnOK)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(160,130)
+    $form.Controls.Add($btnCancel)
+
+    $form.AcceptButton = $btnOK
+    $form.CancelButton = $btnCancel
+
+    $result = [PSCustomObject]@{
+        Username  = $null
+        Password  = $null
+        Cancelled = $false
+    }
+
+    $btnOK.Add_Click({
+        $result.Username = $txtUser.Text
+        $result.Password = $txtPass.Text
+        $form.Close()
+    })
+
+    $btnCancel.Add_Click({
+        $result.Cancelled = $true
+        $form.Close()
+    })
+
+    $form.ShowDialog() | Out-Null
+    return $result
+}
+
+# ---------------------------------------------------------
+# 5. Authentication loop
+# ---------------------------------------------------------
+$authenticated = $false
+$attempt = 0
+$maxAttempts = 3
+
+do {
+    $attempt++
+    Write-Output "INFO: Authentication attempt $attempt of $maxAttempts"
+
+    $login = Show-LoginForm -DefaultUser $loginUserWithDomain
+
+    if ($login.Cancelled) {
+        Write-Output "INFO: User cancelled login"
+        Stop-Transcript
+        exit
+    }
+
+    if ([string]::IsNullOrWhiteSpace($login.Password)) {
+        [System.Windows.Forms.MessageBox]::Show("Password cannot be empty","Error")
+        continue
+    }
+
+    $securePass = ConvertTo-SecureString $login.Password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential ($login.Username, $securePass)
+
+    try {
+        New-PSDrive -Name "AuthTest" -PSProvider FileSystem -Root $DriveMappings[0].SharePath -Credential $cred -ErrorAction Stop | Out-Null
+        Remove-PSDrive -Name "AuthTest" -Force
+
+        Write-Output "INFO: Authentication successful"
+        $authenticated = $true
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Invalid credentials.",
+            "Authentication failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        Write-Output "WARNING: Invalid credentials"
+    }
+
+} until ($authenticated -or $attempt -ge $maxAttempts)
+
+if (-not $authenticated) {
+    Write-Output "ERROR: Max authentication attempts reached"
+    Stop-Transcript
+    exit
+}
+
+# ---------------------------------------------------------
+# 6. Create drive mappings
+# ---------------------------------------------------------
+$restartExplorer = $false
+
+foreach ($mapping in $DriveMappings) {
+
+    $driveLetter = $mapping.DriveName
+    $path = $mapping.SharePath
+
+    if ($mapping.Type -eq "Private") {
+        $path += $userSpecificPath
+    }
+
+    try {
+        New-PSDrive -Name $driveLetter -PSProvider FileSystem -Root $path -Credential $cred -Persist -ErrorAction Stop
+        Write-Output "INFO: Drive ${driveLetter}: mapped successfully"
+        $restartExplorer = $true
+    }
+    catch {
+        Write-Output "ERROR: Failed to map ${driveLetter}: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------
+# 7. Restart Explorer
+# ---------------------------------------------------------
+if ($restartExplorer) {
+    Get-Process Explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+}
+
+Write-Output "=== SMB Drive Mapper Script Completed ==="
+Stop-Transcript
