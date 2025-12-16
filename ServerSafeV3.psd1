@@ -10,12 +10,6 @@
 #     ✔ Windows Credential Vault helpers
 #     ✔ CMTrace log viewer
 #
-# SAFE FOR PUBLIC RELEASE
-#   - No personal data
-#   - No local paths
-#   - No user IDs
-#   - No real certificate names
-#
 # LICENSE:
 #   MIT / BSD / GPL — choose your own license
 ###############################################>
@@ -370,3 +364,4 @@ Removes a credential from the Windows Credential Vault.
 # Export Public Functions
 ################################################
 Export-ModuleMember -Function *
+
