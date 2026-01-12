@@ -1,1 +1,185 @@
+###############################################################################
+#                   PRODUCTION VERSION - SMB DRIVE MAPPER                    #
+###############################################################################
+# CONFIGURATIE NODIG (ENKEL DEZE VELDEN AANPASSEN)
+###############################################################################
+
+# Domeinnaam (bv. YOURDOMAIN)
+$DOMAIN = "YOURDOMAIN"
+
+# Fileserver naam (zonder trailing slash), bv. \\FILESERVER01 of \\FS01
+$FILESERVER = "\\FILESERVER01"
+
+# Share voor T: bv. \SharedData
+$T_SHARE = "\YOUR_T_SHARE"
+
+# Share voor H: rootfolder, bv. \users$
+$H_SHARE = "\YOUR_H_SHARE"
+
+# Prefix voor user home folders, bv. "u" of "home_"
+$USER_PREFIX = "USER_PREFIX"
+
+# Lokale logmap (kan eender wat zijn)
+$LOCAL_LOG_FOLDER = "CompanyFolder"
+
+###############################################################################
+# HIERONDER NIETS MEER AANPASSEN
+###############################################################################
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Logging
+$roamingFolder = Join-Path $Env:LOCALAPPDATA -ChildPath $LOCAL_LOG_FOLDER
+if (!(Test-Path $roamingFolder)) { New-Item -ItemType Directory -Path $roamingFolder | Out-Null }
+Start-Transcript -Path (Join-Path $roamingFolder -ChildPath "SMBdriveMapper.log") -Force
+
+Write-Output "=== Start SMBdriveMapper Script ==="
+
+# Cleanup functie
+function Remove-ExistingMapping {
+    param([string]$DriveLetter)
+    $DriveSpec = "${DriveLetter}:"
+    try {
+        Write-Output "Cleanup: ${DriveSpec}"
+        Remove-PSDrive -Name $DriveLetter -Force -ErrorAction SilentlyContinue
+        cmd /c "net use ${DriveSpec} /delete /y 2>&1" | Out-Null
+    } catch {
+        Write-Output "Cleanup error ${DriveSpec}: $($_.Exception.Message)"
+    }
+}
+
+# Drive config array
+$Drives = @(
+    @{ Letter = "T"; Path = "$FILESERVER$T_SHARE" },
+    @{ Letter = "H"; Path = "$FILESERVER$H_SHARE" }
+)
+
+# Cleanup loop
+foreach ($drive in $Drives) {
+    Remove-ExistingMapping -DriveLetter $drive.Letter
+}
+
+# User parsing
+try {
+    $currentUserName = $Env:USERNAME
+
+    $UserBase = if ($currentUserName.Length -gt 2) { 
+        $currentUserName.Substring(0, $currentUserName.Length - 2)
+    } else { 
+        $currentUserName 
+    }
+
+    $loginUserWithDomain = "$DOMAIN\$USER_PREFIX$UserBase"
+    $userSpecificPath = "\$USER_PREFIX$UserBase"
+} catch {
+    Write-Output "ERROR: gebruikersnaam verwerken mislukte."
+    Stop-Transcript
+    Exit
+}
+
+# GUI login
+function Show-LoginForm {
+    param([string]$DefaultUser)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Netwerkdrive Login"
+    $form.Size = New-Object System.Drawing.Size(300,200)
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+
+    $label1 = New-Object System.Windows.Forms.Label
+    $label1.Text = "Gebruikersnaam:"
+    $label1.Location = New-Object System.Drawing.Point(10,20)
+    $form.Controls.Add($label1)
+
+    $textbox1 = New-Object System.Windows.Forms.TextBox
+    $textbox1.Text = $DefaultUser
+    $textbox1.Location = New-Object System.Drawing.Point(10,40)
+    $textbox1.Size = New-Object System.Drawing.Size(260,20)
+    $form.Controls.Add($textbox1)
+
+    $label2 = New-Object System.Windows.Forms.Label
+    $label2.Text = "Wachtwoord:"
+    $label2.Location = New-Object System.Drawing.Point(10,70)
+    $form.Controls.Add($label2)
+
+    $textbox2 = New-Object System.Windows.Forms.MaskedTextBox
+    $textbox2.PasswordChar = '*'
+    $textbox2.Location = New-Object System.Drawing.Point(10,90)
+    $textbox2.Size = New-Object System.Drawing.Size(260,20)
+    $form.Controls.Add($textbox2)
+
+    $OKButton = New-Object System.Windows.Forms.Button
+    $OKButton.Text = "Aanmelden"
+    $OKButton.Location = New-Object System.Drawing.Point(70,130)
+    $form.Controls.Add($OKButton)
+
+    $CancelButton = New-Object System.Windows.Forms.Button
+    $CancelButton.Text = "Annuleren"
+    $CancelButton.Location = New-Object System.Drawing.Point(160,130)
+    $form.Controls.Add($CancelButton)
+
+    $form.AcceptButton = $OKButton
+    $form.CancelButton = $CancelButton
+
+    $result = [PSCustomObject]@{
+        Username = $null
+        Password = $null
+        Cancelled = $false
+    }
+
+    $OKButton.Add_Click({ $result.Username = $textbox1.Text; $result.Password = $textbox2.Text; $form.Close() })
+    $CancelButton.Add_Click({ $result.Cancelled = $true; $form.Close() })
+
+    $form.ShowDialog() | Out-Null
+    return $result
+}
+
+# Authenticatie loop
+$authenticated = $false
+$attempt = 0
+$maxAttempts = 3
+
+do {
+    $attempt++
+    $login = Show-LoginForm -DefaultUser $loginUserWithDomain
+    if ($login.Cancelled) { Stop-Transcript; Exit }
+
+    if ([string]::IsNullOrWhiteSpace($login.Password)) {
+        [Windows.Forms.MessageBox]::Show("Wachtwoord mag niet leeg zijn.")
+        continue
+    }
+
+    $secpasswd = ConvertTo-SecureString $login.Password -AsPlainText -Force
+    $credentials = New-Object System.Management.Automation.PSCredential ($login.Username, $secpasswd)
+
+    try {
+        New-PSDrive -Name "TempTest" -PSProvider FileSystem -Root $Drives[0].Path -Credential $credentials -ErrorAction Stop | Out-Null
+        Remove-PSDrive -Name "TempTest" -Force
+        $authenticated = $true
+    } catch {
+        [Windows.Forms.MessageBox]::Show("Login mislukt. Poging $attempt van $maxAttempts.")
+    }
+} until ($authenticated -or $attempt -ge $maxAttempts)
+
+if (-not $authenticated) { Stop-Transcript; Exit }
+
+# Mapping loop
+foreach ($drive in $Drives) {
+    $FinalPath = if ($drive.Letter -eq "H") { $drive.Path + $userSpecificPath } else { $drive.Path }
+
+    try {
+        New-PSDrive -Name $drive.Letter -PSProvider FileSystem -Root $FinalPath -Credential $credentials -Persist -ErrorAction Stop
+    } catch {
+        Write-Output "Mapping error: ${drive.Letter}"
+    }
+}
+
+# Explorer herstart
+Get-Process -Name Explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+
+Write-Output "=== Script voltooid ==="
+Stop-Transcript
+
 
