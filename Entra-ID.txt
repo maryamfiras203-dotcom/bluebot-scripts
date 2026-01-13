@@ -1,0 +1,333 @@
+<#
+.SYNOPSIS
+    Synchroniseert gebruikers en groepen van Microsoft Entra ID naar on-premise Active Directory.
+
+.DESCRIPTION
+    Dit script fungeert als een bridge tussen Entra ID en Active Directory. 
+    Het maakt gebruik van Microsoft Graph Delta Queries om efficiënt wijzigingen te verwerken.
+    Belangrijke kenmerken:
+    - Koppeling op basis van EmployeeID.
+    - Automatische aanmaak en updates van AD-gebruikers.
+    - Uitschakelen en verplaatsen van verwijderde gebruikers naar een 'Disabled' OU.
+    - Synchronisatie van groepen en lidmaatschappen met veiligheidscontroles.
+    - Uitgebreide logging en retry-logica voor cloud-verbindingen.
+
+.PARAMETER ConfigPath
+    Het volledige pad naar het JSON-configuratiebestand. Standaard: 'C:\EntraToADSync\config.json'.
+
+.EXAMPLE
+    .\EntraToADSync.ps1 -ConfigPath "C:\Scripts\MyConfig.json"
+    Start de synchronisatie met een specifiek configuratiebestand.
+
+.NOTES
+    Vereist: Administrator-rechten en de modules 'ActiveDirectory' en 'Microsoft.Graph'.
+    Auteur: Gemini AI Thought Partner
+#>
+
+#requires -RunAsAdministrator
+#requires -Modules ActiveDirectory, Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Groups
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+#region Helper functions
+
+function Read-JsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { throw "Bestand niet gevonden: $Path" }
+    Get-Content -Path $Path -Raw | ConvertFrom-Json
+}
+
+function Write-JsonFile {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $dir = Split-Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir | Out-Null
+    }
+    ($Object | ConvertTo-Json -Depth 20) | Set-Content -Path $Path -Encoding UTF8
+}
+
+function Ensure-Dir {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet("INFO","WARN","ERROR")][string]$Level = "INFO"
+    )
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $line = "[$ts][$Level] $Message"
+    Write-Host $line -ForegroundColor $(if($Level -eq "ERROR"){"Red"}elseif($Level -eq "WARN"){"Yellow"}else{"White"})
+    if ($script:LogFile) {
+        Add-Content -Path $script:LogFile -Value $line
+    }
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int]$MaxRetries = 6,
+        [int]$BaseDelaySeconds = 2
+    )
+
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match "429" -or $msg -match "503" -or $msg -match "Timeout") {
+                $delay = [Math]::Min(60, $BaseDelaySeconds * [Math]::Pow(2, $i))
+                Write-Log "Retry $i/$MaxRetries – reden: $msg – wachten $delay sec" "WARN"
+                Start-Sleep -Seconds $delay
+            }
+            else {
+                Write-Log "Permanente fout in Graph API: $msg" "ERROR"
+                throw
+            }
+        }
+    }
+    throw "Invoke-WithRetry gefaald na $MaxRetries pogingen"
+}
+
+function Invoke-GraphGetAll {
+    param([Parameter(Mandatory)][string]$Uri)
+    $items = New-Object System.Collections.Generic.List[object]
+    $next  = $Uri
+    while ($next) {
+        $resp = Invoke-WithRetry { Invoke-MgGraphRequest -Method GET -Uri $next }
+        if ($resp.value) { $resp.value | ForEach-Object { $items.Add($_) } }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $items
+}
+
+function Get-Delta {
+    param([Parameter(Mandatory)][string]$InitialUri, [string]$DeltaLink)
+    $uri = if ($DeltaLink) { $DeltaLink } else { $InitialUri }
+    $items = New-Object System.Collections.Generic.List[object]
+    $next = $uri
+    $newDelta = $null
+    while ($next) {
+        $resp = Invoke-WithRetry { Invoke-MgGraphRequest -Method GET -Uri $next }
+        if ($resp.value) { $resp.value | ForEach-Object { $items.Add($_) } }
+        $next = $resp.'@odata.nextLink'
+        if (-not $next) { $newDelta = $resp.'@odata.deltaLink' }
+    }
+    [pscustomobject]@{ Items = $items; DeltaLink = $newDelta }
+}
+
+function Test-ExcludedUser {
+    param($User, $Config)
+    $upn = [string]$User.userPrincipalName
+    $eid = [string]$User.employeeId
+    if ($Config.ExcludeUsers.UserPrincipalNames -contains $upn) { return $true }
+    if ($eid -and ($Config.ExcludeUsers.EmployeeIds -contains $eid)) { return $true }
+    foreach ($rx in @($Config.ExcludeUsers.RegexUPN)) {
+        if ($rx -and ($upn -match [string]$rx)) { return $true }
+    }
+    return $false
+}
+
+function Test-ExcludedGroup {
+    param($Group, $Config)
+    $name = [string]$Group.displayName
+    if ($Config.ExcludeGroups.DisplayNames -contains $name) { return $true }
+    foreach ($rx in @($Config.ExcludeGroups.RegexNames)) {
+        if ($rx -and ($name -match [string]$rx)) { return $true }
+    }
+    return $false
+}
+
+#endregion Helper functions
+
+#region Graph Connect
+
+function Connect-GraphAppOnlyClientSecret {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$SecretPath
+    )
+    Write-Log "Verbinden met Microsoft Graph..."
+    $enc = Get-Content $SecretPath -Raw
+    $secret = $enc | ConvertTo-SecureString
+    $cred = New-Object System.Management.Automation.PSCredential($ClientId, $secret)
+    Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $cred -NoWelcome
+}
+
+#endregion Graph Connect
+
+#region AD sync functions
+
+function Ensure-ADUserFromEntra {
+    param($EntraUser, $Config)
+    $eid = [string]$EntraUser.employeeId
+    if (-not $eid) { return }
+
+    try {
+        $adUser = Get-ADUser -LDAPFilter "(employeeID=$eid)" -Properties employeeID,mail,department,enabled -ErrorAction SilentlyContinue
+        $params = @{
+            DisplayName       = [string]$EntraUser.displayName
+            GivenName         = [string]$EntraUser.givenName
+            Surname           = [string]$EntraUser.surname
+            EmailAddress      = [string]$EntraUser.mail
+            Department        = [string]$EntraUser.department
+            EmployeeID        = $eid
+        }
+
+        if (-not $adUser) {
+            Write-Log "Nieuwe AD-gebruiker: $eid ($($EntraUser.userPrincipalName))"
+            $sam = ("EID{0}" -f $eid)
+            if ($sam.Length -gt 20) { $sam = $sam.Substring(0,20) }
+            $pwd = ConvertTo-SecureString ([string]$Config.DefaultPassword) -AsPlainText -Force
+            
+            New-ADUser @params -Name $params.DisplayName -SamAccountName $sam -UserPrincipalName ([string]$EntraUser.userPrincipalName) `
+                       -Path ([string]$Config.UserOu) -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true -ErrorAction Stop
+        } else {
+            Write-Log "Update AD-gebruiker: $eid"
+            Set-ADUser -Identity $adUser.DistinguishedName @params -ErrorAction Stop
+        }
+    } catch {
+        Write-Log "Fout bij verwerken gebruiker $eid : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Disable-AndMove-ADUser {
+    param([string]$EmployeeId, $Config)
+    try {
+        $adUser = Get-ADUser -LDAPFilter "(employeeID=$EmployeeId)" -ErrorAction Stop
+        Write-Log "Uitschakelen en verplaatsen: EID=$EmployeeId" "WARN"
+        Disable-ADAccount -Identity $adUser.DistinguishedName -ErrorAction Stop
+        $targetOu = [string]$Config.DisabledUserOu
+        if ($targetOu -and ($adUser.DistinguishedName -notlike "*$targetOu*")) {
+            Move-ADObject -Identity $adUser.DistinguishedName -TargetPath $targetOu -ErrorAction Stop
+        }
+    } catch {
+        Write-Log "Fout bij uitschakelen gebruiker $EmployeeId : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Sync-GroupMembership {
+    param(
+        [Parameter(Mandatory)][string]$EntraGroupId,
+        [Parameter(Mandatory)][string]$EntraGroupName,
+        [Parameter(Mandatory)]$Config,
+        [int]$SafetyThresholdPercent = 50
+    )
+
+    try {
+        $adGroup = Get-ADGroup -Identity $EntraGroupName -ErrorAction Stop
+        
+        # Haal Entra-leden op
+        $members = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupId/members?`$select=id,employeeId"
+        $desiredEids = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($m in $members) {
+            if ($m.'@odata.type' -eq '#microsoft.graph.user' -and $m.employeeId) {
+                [void]$desiredEids.Add([string]$m.employeeId)
+            }
+        }
+
+        # Haal huidige AD-leden op
+        $currentMembers = @{}
+        $adMembers = Get-ADGroupMember -Identity $adGroup.DistinguishedName | Get-ADUser -Properties employeeID
+        foreach ($m in $adMembers) {
+            if ($m.employeeID) { $currentMembers[[string]$m.employeeID] = $m.DistinguishedName }
+        }
+
+        # SAFETY CHECK: Stop als de cloud-groep ineens leeg is bij een grote groep
+        if ($currentMembers.Count -gt 10 -and $desiredEids.Count -eq 0) {
+            Write-Log "SAFETY STOP: Sync afgebroken voor '$EntraGroupName' (Cloud geeft 0 leden, AD heeft er $($currentMembers.Count))." "ERROR"
+            return
+        }
+
+        # Toevoegen
+        foreach ($eid in $desiredEids) {
+            if (-not $currentMembers.ContainsKey($eid)) {
+                $u = Get-ADUser -LDAPFilter "(employeeID=$eid)" -ErrorAction SilentlyContinue
+                if ($u) {
+                    Add-ADGroupMember -Identity $adGroup.DistinguishedName -Members $u.DistinguishedName -ErrorAction Stop
+                    Write-Log "Lid toegevoegd aan $EntraGroupName : $eid"
+                }
+            }
+        }
+
+        # Verwijderen
+        foreach ($eid in $currentMembers.Keys) {
+            if (-not $desiredEids.Contains($eid)) {
+                Remove-ADGroupMember -Identity $adGroup.DistinguishedName -Members $currentMembers[$eid] -Confirm:$false -ErrorAction Stop
+                Write-Log "Lid verwijderd uit $EntraGroupName : $eid"
+            }
+        }
+    } catch {
+        Write-Log "Fout bij lidmaatschap sync $EntraGroupName : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+#endregion AD sync functions
+
+#region Main
+
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$ConfigPath = "C:\EntraToADSync\config.json"
+)
+
+try {
+    $config = Read-JsonFile -Path $ConfigPath
+    Ensure-Dir -Path ([string]$config.LogPath)
+    $script:LogFile = Join-Path ([string]$config.LogPath) ("sync-{0}.log" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+
+    Write-Log "=== Start EntraToADSync ==="
+    
+    $statePath = [string]$config.StatePath
+    $state = if (Test-Path $statePath) { Read-JsonFile -Path $statePath } else { [pscustomobject]@{} }
+
+    Connect-GraphAppOnlyClientSecret -TenantId $config.TenantId -ClientId $config.ClientId -SecretPath $config.SecretPath
+
+    # Gebruikers
+    Write-Log "Ophalen gebruikers delta..."
+    $usersDelta = Get-Delta -InitialUri "https://graph.microsoft.com/v1.0/users/delta?`$select=id,displayName,givenName,surname,userPrincipalName,employeeId,mail,department" -DeltaLink $state.UsersDeltaLink
+    foreach ($u in $usersDelta.Items) {
+        if ($u.removed) {
+            if ($u.employeeId -and -not (Test-ExcludedUser -User $u -Config $config)) {
+                Disable-AndMove-ADUser -EmployeeId ([string]$u.employeeId) -Config $config
+            }
+        } else {
+            if (-not (Test-ExcludedUser -User $u -Config $config)) {
+                Ensure-ADUserFromEntra -EntraUser $u -Config $config
+            }
+        }
+    }
+    $state | Add-Member -Force -NotePropertyName UsersDeltaLink -NotePropertyValue $usersDelta.DeltaLink
+
+    # Groepen
+    Write-Log "Ophalen groepen delta..."
+    $groupsDelta = Get-Delta -InitialUri "https://graph.microsoft.com/v1.0/groups/delta?`$select=id,displayName,description" -DeltaLink $state.GroupsDeltaLink
+    foreach ($g in $groupsDelta.Items) {
+        if (-not $g.removed -and -not (Test-ExcludedGroup -Group $g -Config $config)) {
+            if ($g.displayName) {
+                Sync-GroupMembership -EntraGroupId $g.id -EntraGroupName $g.displayName -Config $config
+            }
+        }
+    }
+    $state | Add-Member -Force -NotePropertyName GroupsDeltaLink -NotePropertyValue $groupsDelta.DeltaLink
+
+    Write-JsonFile -Object $state -Path $statePath
+    Write-Log "=== Sync succesvol afgerond ==="
+}
+catch {
+    Write-Log "KRITIEKE FOUT: $($_.Exception.Message)" "ERROR"
+}
+finally {
+    Disconnect-MgGraph | Out-Null
+}
+
+#endregion Main
