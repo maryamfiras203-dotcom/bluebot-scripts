@@ -1,0 +1,198 @@
+<#
+.SYNOPSIS
+    SFTP download script met extensie-whitelist, CMTrace logging en WinSCP automatisatie.
+    Productieversie met versleuteld wachtwoord (DPAPI) en duidelijke configuratie.
+ 
+.DESCRIPTION
+    SFTP -> list -> whitelist filter -> download -> logging.
+    Wachtwoord staat NIET in het script, maar in een per-user/machine versleuteld bestand.
+    Als iemand dit script + passwordfile kopieert naar een andere machine of andere user,
+    zal het wachtwoord NIET meer te ontsleutelen zijn en stopt het script met een foutmelding.
+#>
+ 
+Import-Module FlowAutomatic.Core -Force
+ 
+# ================== CONFIGURATIE (AANPASBAAR) ==================
+# Hieronder staan de dingen die iemand MAG aanpassen voor een andere omgeving.
+ 
+# --- SFTP servergegevens ---
+$Server   = "192.168.125.20"     # SFTP server IP of hostname
+$User     = "sftp_test"          # SFTP gebruiker
+$Port     = 22                   # SFTP poort (meestal 22)
+ 
+# --- Paden ---
+$EncryptedPasswordPath = "C:\Scripts\sftp_password.txt"   # Versleuteld wachtwoordbestand
+$WinSCPPath            = "C:\Program Files (x86)\WinSCP\WinSCP.exe"  # Locatie van WinSCP.exe
+ 
+# --- Remote -> Local mappings ---
+$Mappings = @(
+    @{ Remote = "white";       Local = "C:\DATA\white" }
+    @{ Remote = "blacklist";   Local = "C:\DATA\blacklist" }
+    @{ Remote = "groenelijst"; Local = "C:\DATA\groenelijst" }
+)
+ 
+# --- Whitelist / blacklist extensies ---
+$AllowedExtensions = ".txt", ".csv", ".list"
+$BlockedPattern    = '\.(exe|bat|cmd|ps1|vbs|js|zip)$'
+ 
+# --- Logging ---
+$LogPath = "C:\Temp"
+$LogName = "SFTP_Whitelist_Enforcer.log"
+ 
+# --- (Optioneel) Machine-lock: verwachte computernaam ---
+# Dit zorgt ervoor dat het script alleen op deze specifieke machine hoort te draaien.
+# Als iemand het script kopieert naar een andere pc met een andere naam, faalt het expliciet.
+$ExpectedComputerName = "SERVER01"   # <-- PAS AAN naar jouw servernaam, of laat leeg ("") om uit te zetten
+# ===============================================================
+ 
+ 
+# ================== NIET AANPASSEN ONDER DIT BLOK ==================
+ 
+# ---- Machine-lock check ----
+if (![string]::IsNullOrWhiteSpace($ExpectedComputerName) -and
+    $env:COMPUTERNAME -ne $ExpectedComputerName) {
+ 
+    Write-Output "FOUT: Dit script is geconfigureerd voor machine '$ExpectedComputerName', maar draait op '$($env:COMPUTERNAME)'."
+    throw "Onjuiste machine voor dit script."
+}
+ 
+# ---- Controle WinSCP ----
+if (-not (Test-Path $WinSCPPath)) {
+    Write-Output "FOUT: WinSCP niet gevonden op pad: $WinSCPPath"
+    throw "WinSCP ontbreekt"
+}
+ 
+$WinSCPDll = Join-Path (Split-Path $WinSCPPath) "WinSCPnet.dll"
+if (-not (Test-Path $WinSCPDll)) {
+    Write-Output "FOUT: WinSCPnet.dll ontbreekt naast WinSCP.exe"
+    throw "WinSCPnet.dll ontbreekt"
+}
+ 
+Add-Type -Path $WinSCPDll
+ 
+# ---- Versleuteld wachtwoord inlezen ----
+if (-not (Test-Path $EncryptedPasswordPath)) {
+    Write-Output "FOUT: Versleuteld wachtwoordbestand niet gevonden: $EncryptedPasswordPath"
+    throw "Geen wachtwoordbestand"
+}
+ 
+try {
+    $SecurePassword = Get-Content $EncryptedPasswordPath | ConvertTo-SecureString
+    $Password       = [System.Net.NetworkCredential]::new("", $SecurePassword).Password
+}
+catch {
+    Write-Output "FOUT: Kon wachtwoord niet ontsleutelen."
+    Write-Output "Waarschijnlijk is het wachtwoordbestand of script gekopieerd naar een andere user/machine."
+    throw "Wachtwoord decryptie mislukt"
+}
+ 
+# ---- Logging starten ----
+$ctx = Start-Script -LogPath $LogPath -LogName $LogName
+ 
+try {
+    Write-Log -Type INFO -Message "START: SFTP whitelist enforcer naar $Server"
+ 
+    # ---- WinSCP sessie opties ----
+    $sessionOptions = New-Object WinSCP.SessionOptions -Property @{
+        Protocol = [WinSCP.Protocol]::Sftp
+        HostName = $Server
+        UserName = $User
+        Password = $Password
+        PortNumber = $Port
+ 
+        # LET OP: in echte productie wil je bij voorkeur SshHostKeyFingerprint gebruiken
+        # met de exacte fingerprint. Nu accepteren we ANY host key (minder veilig, maar praktisch).
+        SshHostKeyPolicy = "GiveUpSecurityAndAcceptAny"
+    }
+ 
+    $session = New-Object WinSCP.Session
+    Write-Log -Type INFO -Message "SFTP sessie openen via WinSCP"
+    $session.Open($sessionOptions)
+ 
+    # ---- Per mapping ----
+    foreach ($map in $Mappings) {
+ 
+        Write-Log -Type INFO -Message "Verwerken map: $($map.Remote)"
+ 
+        if (-not (Test-Path $map.Local)) {
+            New-Item -ItemType Directory -Path $map.Local -Force | Out-Null
+            Write-Log -Type INFO -Message "Lokale map aangemaakt: $($map.Local)"
+        }
+ 
+        $remotePath = "/$($map.Remote)"
+ 
+        # ---- LIST ----
+        try {
+            $dirInfo = $session.ListDirectory($remotePath)
+        }
+        catch {
+            Write-Log -Type ERROR -Message "Kan '$($map.Remote)' niet uitlezen: $($_.Exception.Message)"
+            continue
+        }
+ 
+        $validFiles = @()
+ 
+        # ---- FILTER ----
+        foreach ($item in $dirInfo.Files) {
+ 
+            if ($item.IsDirectory) {
+                Write-Log -Type INFO -Message "Overgeslagen (map): $($item.Name)"
+                continue
+            }
+ 
+            $name = $item.Name
+            $ext  = [System.IO.Path]::GetExtension($name).ToLower()
+ 
+            if ([string]::IsNullOrWhiteSpace($ext)) {
+                Write-Log -Type INFO -Message "Overgeslagen (geen extensie): $name"
+                continue
+            }
+ 
+            if ($name -match $BlockedPattern) {
+                Write-Log -Type ERROR -Message "GEWEIGERD (onveilig): $($map.Remote)/$name"
+                continue
+            }
+ 
+            if ($AllowedExtensions -contains $ext) {
+                $validFiles += $item
+                Write-Log -Type INFO -Message "Goedgekeurd: $name"
+            }
+            else {
+                Write-Log -Type WARNING -Message "Niet in whitelist: $name ($ext)"
+            }
+        }
+ 
+        # ---- DOWNLOAD ----
+        if ($validFiles.Count -gt 0) {
+ 
+            Write-Log -Type INFO -Message "$($validFiles.Count) bestanden downloaden"
+ 
+            foreach ($f in $validFiles) {
+                $remoteFile = "$remotePath/$($f.Name)"
+                $localFile  = Join-Path $map.Local $f.Name
+ 
+                try {
+                    $session.GetFiles($remoteFile, $localFile, $false).Check()
+                    Write-Log -Type INFO -Message "Download OK: $remoteFile -> $localFile"
+                }
+                catch {
+                    Write-Log -Type ERROR -Message "Download mislukt voor '$remoteFile': $($_.Exception.Message)"
+                }
+            }
+ 
+        }
+        else {
+            Write-Log -Type INFO -Message "Geen downloads nodig voor $($map.Remote)"
+        }
+    }
+ 
+    Write-Log -Type INFO -Message "SCRIPT VOLTOOID"
+}
+catch {
+    Write-Log -Type ERROR -Message "SCRIPT FATAAL: $($_.Exception.Message)"
+    throw
+}
+finally {
+    if ($session) { $session.Dispose() }
+    Stop-Script -StartDateTime $ctx.StartDateTime
+}
